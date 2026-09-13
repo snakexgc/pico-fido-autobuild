@@ -1,0 +1,84 @@
+# Schedule uses UTC: 07:00 UTC = 15:00 Asia/Shanghai (Beijing time).
+# Install on the default branch. GitHub scheduled runs may start late under load.
+# Merge upstream history without force-pushing or replacing local-only workflows.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      UPSTREAM_URL: https://github.com/polhenarejos/pico-fido.git
+      UPSTREAM_BRANCH: main
+      TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Checkout repository default branch with full history
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Merge upstream and push only when updated
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags "$UPSTREAM_URL" "refs/heads/$UPSTREAM_BRANCH"
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          before_sha=$(git rev-parse HEAD)
+
+          {
+            echo '## Upstream synchronization'
+            echo "Upstream: $UPSTREAM_URL ($UPSTREAM_BRANCH)"
+            echo "Target branch: $TARGET_BRANCH"
+            echo "Before: $before_sha"
+            echo "Upstream commit: $upstream_sha"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'Already up to date. No push or firmware build needed.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if ! git merge --no-edit "$upstream_sha"; then
+            {
+              echo 'Merge failed; no changes were pushed. Resolve conflicts manually.'
+              echo '```text'
+              git diff --name-only --diff-filter=U
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            git merge --abort || true
+            echo '::error::Upstream merge failed. The remote branch was not changed.'
+            exit 1
+          fi
+
+          # A concurrent remote update or branch protection causes a normal failure;
+          # never force-push over commits added by someone else.
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+          echo "Synchronized successfully: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      # GITHUB_TOKEN pushes do not trigger push workflows. Explicit dispatch does.
+      - name: Trigger firmware build and release after synchronization
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run firmware-release.yml --repo "$GITHUB_REPOSITORY" --ref "$TARGET_BRANCH"
+          echo 'Dispatched Firmware matrix release for the updated default branch.' >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,436 @@
+# Self-contained: scripts and reports are generated only on the Actions runner.
+# Preserve the complete hardware x VIDPID product, grouped into 8 Pico + 2 ESP jobs.
+# Push builds every branch; default-branch pushes and manual runs publish releases.
+# Individual failures are skipped; zero successful firmware means no release.
+name: Firmware matrix release
+
+on:
+  push:
+    branches: ['**']
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.github/FUNDING.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Keep completed firmware when another commit arrives during a long matrix run.
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: raspberrypi/pico-sdk
+          ref: bddd20f928ce76142793bef434d4f75f4af6e433 # 2.1.1
+          path: build-pico-sdk
+          persist-credentials: false
+      - name: Prepare embedded build and release automation
+        run: |
+          cat > build-automation.py <<'PY'
+          #!/usr/bin/env python3
+          """Plan, build and publish the firmware product matrix without patching sources."""
+
+          import argparse
+          from collections import defaultdict
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shlex
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          import zipfile
+
+          ROOT = Path.cwd()
+          SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+
+
+          def write_json(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+          def digest(path):
+              with path.open("rb") as stream:
+                  return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+          def output(name, value):
+              if os.environ.get("GITHUB_OUTPUT"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+                      stream.write(f"{name}={value}\n")
+
+
+          def plan(args):
+              sdk = args.pico_sdk.resolve()
+              boards = sorted(p.stem for p in (sdk / "src/boards/include/boards").glob("*.h")
+                              if p.stem != "none")
+              source = (ROOT / "pico-keys-sdk/picokeys_sdk_import.cmake").read_text(encoding="utf-8")
+              models = list(dict.fromkeys(re.findall(r'VIDPID\s+STREQUAL\s+"([^"]+)"', source)))
+              if not boards or not models:
+                  raise ValueError("No boards or VIDPID models found; refusing an empty build plan")
+              hardware = [{"name": b, "family": "pico", "target": b, "extension": "uf2"} for b in boards]
+              hardware += [{"name": f"esp32-{suffix}", "family": "esp32", "target": f"esp32{suffix}",
+                            "extension": "bin"} for suffix in ("s2", "s3")]
+              if not all(SAFE_NAME.fullmatch(n) for n in boards + models):
+                  raise ValueError("Unsafe hardware/model name")
+              sdk_sha = subprocess.check_output(["git", "-C", str(sdk), "rev-parse", "HEAD"], text=True).strip()
+              result = {"hardware": hardware, "models": models, "pico_sdk_sha": sdk_sha,
+                        "esp_idf_version": "v5.5.1", "source_sha": os.environ.get("GITHUB_SHA") or
+                        subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()}
+              write_json(args.plan, result)
+              # Eight Pico batches share toolchain setup; keep the two ESP targets separate.
+              groups = [{"name": f"pico-{i + 1}", "family": "pico",
+                         "hardware": boards[i::8]} for i in range(min(8, len(boards)))]
+              groups += [{"name": h["name"], "family": "esp32", "hardware": [h["name"]]}
+                         for h in hardware if h["family"] == "esp32"]
+              output("matrix", json.dumps({"include": groups}, separators=(",", ":")))
+              print(f"Planned {len(hardware)} hardware targets x {len(models)} models = {len(hardware) * len(models)} builds")
+
+
+          def run(command, cwd, log):
+              log.write("\n$ " + shlex.join(map(str, command)) + "\n")
+              log.flush()
+              subprocess.run(list(map(str, command)), cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
+                             check=True, timeout=1800)
+
+
+          def build_one(hardware, model, work, log):
+              target = hardware["target"]
+              build_dir = work / "build"
+              if hardware["family"] == "pico":
+                  sdk = Path(os.environ["PICO_SDK_PATH"]).resolve()
+                  run(["cmake", "-S", ROOT, "-B", build_dir, "-G", "Ninja",
+                       f"-DPICO_SDK_PATH={sdk}", f"-DPICO_BOARD={target}", f"-DVIDPID:STRING={model}",
+                       "-DCMAKE_BUILD_TYPE=Release"], ROOT, log)
+                  run(["cmake", "--build", build_dir, "--parallel", str(os.cpu_count() or 2)], ROOT, log)
+                  return build_dir / "pico_fido.uf2"
+
+              # ESP-IDF can override USB_VID/PID with Kconfig values. Seed both, so the
+              # filename and the actual USB descriptors agree on every fresh build.
+              source = (ROOT / "pico-keys-sdk/picokeys_sdk_import.cmake").read_text(encoding="utf-8")
+              match = re.search(r'VIDPID\s+STREQUAL\s+"' + re.escape(model) +
+                                r'"\)\s*set\(USB_VID\s+(0x[0-9A-Fa-f]+)\)\s*'
+                                r'set\(USB_PID\s+(0x[0-9A-Fa-f]+)\)', source)
+              if not match:
+                  raise ValueError(f"Cannot resolve USB VID/PID for {model}")
+              defaults = work / "sdkconfig.defaults"
+              defaults.write_text(
+                  (ROOT / "pico-keys-sdk/config/esp32/sdkconfig.defaults").read_text(encoding="utf-8") +
+                  f'\nCONFIG_TINYUSB_DESC_USE_ESPRESSIF_VID=n\nCONFIG_TINYUSB_DESC_CUSTOM_VID={match[1]}\n'
+                  f'CONFIG_TINYUSB_DESC_USE_DEFAULT_PID=n\nCONFIG_TINYUSB_DESC_CUSTOM_PID={match[2]}\n',
+                  encoding="utf-8")
+              run([sys.executable, Path(os.environ["IDF_PATH"]) / "tools/idf.py",
+                   "-B", build_dir, "-D", f"IDF_TARGET={target}", "-D", f"VIDPID:STRING={model}",
+                   "-D", f"SDKCONFIG={work / 'sdkconfig'}", "-D", f"SDKCONFIG_DEFAULTS={defaults}",
+                   "build"], ROOT, log)
+              config = (work / "sdkconfig").read_text(encoding="utf-8")
+              for field, expected in (("VID", match[1]), ("PID", match[2])):
+                  actual = re.search(rf"^CONFIG_TINYUSB_DESC_CUSTOM_{field}=(\S+)$", config, re.MULTILINE)
+                  if not actual or int(actual[1], 0) != int(expected, 0):
+                      raise ValueError(f"ESP USB {field} does not match {model}")
+              merged = work / "merged.bin"
+              run([sys.executable, "-m", "esptool", "--chip", target, "merge_bin", "-o", merged,
+                   "@flash_args"], build_dir, log)
+              return merged
+
+
+          def build(args):
+              spec = json.loads(args.plan.read_text(encoding="utf-8"))
+              hardware = next(h for h in spec["hardware"] if h["name"] == args.hardware)
+              destination = args.output.resolve() / args.hardware
+              destination.mkdir(parents=True, exist_ok=True)
+              build_root = ROOT / "build-autobuild"
+              build_root.mkdir(exist_ok=True)
+              for model in spec["models"]:
+                  name = f"pico-fido-{args.hardware}-{model}"
+                  firmware = destination / f"{name}.{hardware['extension']}"
+                  # Never let an earlier successful invocation masquerade as this build.
+                  firmware.unlink(missing_ok=True)
+                  record_path = destination / f"{name}.json"
+                  record = {"hardware": args.hardware, "model": model, "status": "failed",
+                            "error": "Build interrupted before completion", "file": firmware.name}
+                  write_json(record_path, record)
+                  start = time.monotonic()
+                  print(f"::group::{name}", flush=True)
+                  with (destination / f"{name}.log").open("w", encoding="utf-8") as log:
+                      try:
+                          with tempfile.TemporaryDirectory(prefix=name + "-", dir=build_root) as temporary:
+                              artifact = build_one(hardware, model, Path(temporary), log)
+                              if not artifact.is_file() or artifact.stat().st_size == 0:
+                                  raise ValueError("Build produced no nonempty firmware")
+                              shutil.copyfile(artifact, firmware)
+                          record.update(status="success", error="", sha256=digest(firmware))
+                      except Exception as exc:
+                          firmware.unlink(missing_ok=True)
+                          record["error"] = str(exc)
+                          log.write(f"\nFAILED: {exc}\n")
+                          print(f"::warning::{name} failed: {exc}", flush=True)
+                  record["seconds"] = round(time.monotonic() - start, 1)
+                  write_json(record_path, record)
+                  print(f"{record['status']}: {name}\n::endgroup::", flush=True)
+
+
+          def markdown_cell(value):
+              return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ").replace("`", "'")
+
+
+          def report(args):
+              spec = json.loads(args.plan.read_text(encoding="utf-8"))
+              release = args.output.resolve()
+              release.mkdir(parents=True, exist_ok=False)
+              records, successful = [], []
+              for hardware in spec["hardware"]:
+                  for model in spec["models"]:
+                      name = f"pico-fido-{hardware['name']}-{model}"
+                      filename = f"{name}.{hardware['extension']}"
+                      directory = args.input / hardware["name"]
+                      record = {"hardware": hardware["name"], "model": model, "status": "failed",
+                                "file": filename, "error": "No result: checkout, setup, job or artifact upload failed"}
+                      path = directory / f"{name}.json"
+                      try:
+                          if path.is_file():
+                              record.update(json.loads(path.read_text(encoding="utf-8")))
+                          firmware = directory / filename
+                          if record["status"] == "success":
+                              if not firmware.is_file() or not firmware.stat().st_size or digest(firmware) != record.get("sha256"):
+                                  record.update(status="failed", error="Firmware missing, empty or SHA256 mismatch")
+                              else:
+                                  successful.append((hardware["name"], firmware))
+                      except (ValueError, OSError) as exc:
+                          record.update(status="failed", error=f"Invalid result: {exc}")
+                      records.append(record)
+              passed = len(successful)
+              failed = len(records) - passed
+              output("success_count", passed)
+              run_url = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
+                         f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}")
+              intro = ["# Firmware build report", "", f"Commit: `{spec['source_sha']}`", "",
+                       f"Pico SDK: `{spec['pico_sdk_sha']}`; ESP-IDF: `{spec['esp_idf_version']}`", "",
+                       f"Total: **{len(records)}**; successful: **{passed}**; failed: **{failed}**.", "",
+                       f"[Actions build logs]({run_url})", "",
+                       "Models select USB VID/PID identities; firmware functionality remains Pico FIDO.",
+                       "Builds are unsigned. ESP32 BIN files include the bootloader and partition table; flash at 0x0.", ""]
+              if not passed:
+                  intro += ["All builds failed. No release will be published.", ""]
+              grouped = len(successful) + 5 > 1000
+              if passed:
+                  intro += ["Firmware is grouped into per-hardware ZIP files (GitHub's 1,000-asset limit)."
+                            if grouped else "Successful firmware files are attached individually.",
+                            "Full per-combination results: `build-report.md` / `build-results.json`; logs: `build-logs.zip`.", ""]
+              table = ["| Hardware | Successful models | Failed models |", "| --- | --- | --- |"]
+              for hardware in spec["hardware"]:
+                  rows = [r for r in records if r["hardware"] == hardware["name"]]
+                  table.append(f"| {hardware['name']} | " + ", ".join(r["model"] for r in rows if r["status"] == "success") +
+                               " | " + ", ".join(r["model"] for r in rows if r["status"] != "success") + " |")
+              notes = "\n".join(intro + table) + "\n"
+              (release / "release-notes.md").write_text(notes, encoding="utf-8")
+              details = ["", "## Per-combination results", "", "| Hardware | Model | Result | Error |",
+                         "| --- | --- | --- | --- |"]
+              details += ["| " + " | ".join(markdown_cell(r[k]) for k in ("hardware", "model", "status", "error")) + " |"
+                          for r in records]
+              (release / "build-report.md").write_text(notes + "\n".join(details) + "\n", encoding="utf-8")
+              write_json(release / "build-results.json", {"plan": spec, "success": passed, "failed": failed, "results": records})
+              with zipfile.ZipFile(release / "build-logs.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+                  for path in sorted(args.input.rglob("*.log")):
+                      archive.write(path, path.relative_to(args.input).as_posix())
+              if grouped:
+                  bundles = defaultdict(list)
+                  for hardware, path in successful:
+                      bundles[hardware].append(path)
+                  for hardware, paths in bundles.items():
+                      with zipfile.ZipFile(release / f"pico-fido-{hardware}.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+                          for path in paths:
+                              archive.write(path, path.name)
+              else:
+                  for _, path in successful:
+                      shutil.copyfile(path, release / path.name)
+              checksums = [f"{digest(path)}  {path.name}" for _, path in successful]
+              # Also checksum the downloadable archives and reports.
+              checksums += [f"{digest(path)}  {path.name}" for path in sorted(release.iterdir())
+                            if path.suffix not in (".uf2", ".bin")]
+              (release / "SHA256SUMS").write_text("\n".join(checksums) + "\n", encoding="utf-8")
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
+                      stream.write(notes)
+              print(f"Successful: {passed}; failed: {failed}")
+              return passed
+
+
+          def publish(args):
+              release = args.input.resolve()
+              result = json.loads((release / "build-results.json").read_text(encoding="utf-8"))
+              if result["success"] == 0:
+                  print("No successful firmware; skipping release")
+                  return
+              tag = f"autobuild-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+              repository = os.environ["GITHUB_REPOSITORY"]
+              base = ["gh", "release"]
+              subprocess.run(base + ["create", tag, "--repo", repository, "--target", result["plan"]["source_sha"],
+                                    "--title", f"Pico FIDO {tag}", "--notes-file", str(release / "release-notes.md"),
+                                    "--draft"], check=True)
+              assets = sorted(str(p) for p in release.iterdir() if p.is_file())
+              for offset in range(0, len(assets), 50):
+                  subprocess.run(base + ["upload", tag, "--repo", repository] + assets[offset:offset + 50], check=True)
+              # A failed upload leaves an unpublished draft, never a partial public release.
+              subprocess.run(base + ["edit", tag, "--repo", repository, "--draft=false", "--latest=false"], check=True)
+
+
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              sub = parser.add_subparsers(dest="command", required=True)
+              p = sub.add_parser("plan")
+              p.add_argument("--pico-sdk", type=Path, required=True)
+              p.add_argument("--plan", type=Path, default=Path("build-plan.json"))
+              p = sub.add_parser("build")
+              p.add_argument("--plan", type=Path, default=Path("build-plan.json"))
+              p.add_argument("--hardware", required=True)
+              p.add_argument("--output", type=Path, default=Path("build-results"))
+              p = sub.add_parser("batch")
+              p.add_argument("--plan", type=Path, default=Path("build-plan.json"))
+              p.add_argument("--output", type=Path, default=Path("build-results"))
+              p = sub.add_parser("report")
+              p.add_argument("--plan", type=Path, default=Path("build-plan.json"))
+              p.add_argument("--input", type=Path, default=Path("build-results"))
+              p.add_argument("--output", type=Path, default=Path("build-release"))
+              p = sub.add_parser("publish")
+              p.add_argument("--input", type=Path, default=Path("build-release"))
+              args = parser.parse_args()
+              if args.command == "batch":
+                  for hardware in json.loads(os.environ["HARDWARE_GROUP"]):
+                      args.hardware = hardware
+                      try:
+                          build(args)
+                      except Exception as exc:
+                          # Missing records are marked failed when the full plan is reconciled.
+                          print(f"::warning::Hardware {hardware} failed: {exc}", flush=True)
+              else:
+                  {"plan": plan, "build": build, "report": report, "publish": publish}[args.command](args)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+      - name: Generate complete plan and ten build groups
+        id: plan
+        run: python3 build-automation.py plan --pico-sdk build-pico-sdk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-plan
+          path: |
+            build-plan.json
+            build-automation.py
+          if-no-files-found: error
+
+  build:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware-plan
+      - name: Checkout Pico SDK
+        if: matrix.family == 'pico'
+        uses: actions/checkout@v6
+        with:
+          repository: raspberrypi/pico-sdk
+          ref: bddd20f928ce76142793bef434d4f75f4af6e433 # 2.1.1
+          path: build-pico-sdk
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Pico toolchain
+        if: matrix.family == 'pico'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib libusb-1.0-0-dev pkg-config
+      - name: Build all Pico identities, continuing after individual failures
+        if: matrix.family == 'pico'
+        env:
+          HARDWARE_GROUP: ${{ toJSON(matrix.hardware) }}
+          PICO_SDK_PATH: ${{ github.workspace }}/build-pico-sdk
+        run: python3 build-automation.py batch
+      - name: Build all ESP identities, continuing after individual failures
+        if: matrix.family == 'esp32'
+        env:
+          HARDWARE_GROUP: ${{ toJSON(matrix.hardware) }}
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/project" -w /project -e HARDWARE_GROUP \
+            espressif/idf:v5.5.1 python build-automation.py batch
+      - name: Preserve firmware and per-combination reports even after failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-result-${{ matrix.name }}
+          path: build-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  release:
+    needs: [plan, build]
+    if: always() && !cancelled() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware-plan
+      - name: Download available results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-result-*
+          path: build-results
+          merge-multiple: true
+      - name: Reconcile every planned combination and prepare release assets
+        id: report
+        run: python3 build-automation.py report
+      - name: Preserve report even when every firmware failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-report
+          path: |
+            build-release/*.md
+            build-release/*.json
+            build-release/build-logs.zip
+            build-release/SHA256SUMS
+          if-no-files-found: error
+      - name: Publish successful firmware on default branch or manual invocation
+        if: steps.report.outputs.success_count != '0' && (github.ref_name == github.event.repository.default_branch || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 build-automation.py publish
+      - name: Mark all-failed build without publishing a release
+        if: steps.report.outputs.success_count == '0'
+        run: |
+          echo 'All firmware builds failed. See the summary and firmware-report artifact.' >&2
+          exit 1
