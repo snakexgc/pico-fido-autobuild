@@ -166,10 +166,21 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
             {
                 CBOR_FIELD_GET_KEY_TEXT(2);
                 if (strcmp(_fd2, "hmac-secret") == 0) {
-                    extensions.hmac_secret = ptrue;
+                    CBOR_ASSERT(cbor_value_is_map(&_f2) == true || cbor_value_is_boolean(&_f2) == true);
+                    if (cbor_value_is_map(&_f2) && !cbor_value_is_length_known(&_f2)) {
+                        CBOR_ERROR(CTAP2_ERR_INVALID_CBOR);
+                    }
+                    if (cbor_value_is_boolean(&_f2)) {
+                        bool ignored = false;
+                        CBOR_CHECK(cbor_value_get_boolean(&_f2, &ignored));
+                        CBOR_CHECK(cbor_value_advance_fixed(&_f2));
+                        continue;
+                    }
                     uint64_t ukey = 0;
+                    bool hmac_secret_has_fields = false;
                     CBOR_PARSE_MAP_START(_f2, 3)
                     {
+                        hmac_secret_has_fields = true;
                         CBOR_FIELD_GET_UINT(ukey, 3);
                         if (ukey == 0x01) {
                             CBOR_CHECK(COSE_read_key(&_f3, &kty, &alg, &crv, &kax, &kay));
@@ -188,6 +199,29 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
                         }
                     }
                     CBOR_PARSE_MAP_END(_f2, 3);
+                    if (hmac_secret_has_fields) {
+                        extensions.hmac_secret = ptrue;
+                    }
+                    continue;
+                }
+                if (strcmp(_fd2, "credProtect") == 0) {
+                    uint64_t ignored = 0;
+                    CBOR_FIELD_GET_UINT(ignored, 2);
+                    continue;
+                }
+                if (strcmp(_fd2, "minPinLength") == 0) {
+                    bool ignored = false;
+                    CBOR_ASSERT(cbor_value_is_boolean(&_f2) == true);
+                    CBOR_CHECK(cbor_value_get_boolean(&_f2, &ignored));
+                    CBOR_CHECK(cbor_value_advance_fixed(&_f2));
+                    continue;
+                }
+                if (strcmp(_fd2, "hmac-secret-mc") == 0) {
+                    CBOR_ASSERT(cbor_value_is_map(&_f2) == true || cbor_value_is_boolean(&_f2) == true);
+                    if (cbor_value_is_map(&_f2) && !cbor_value_is_length_known(&_f2)) {
+                        CBOR_ERROR(CTAP2_ERR_INVALID_CBOR);
+                    }
+                    CBOR_ADVANCE(2);
                     continue;
                 }
                 CBOR_FIELD_KEY_TEXT_VAL_BOOL(2, "credBlob", credBlob);
@@ -219,8 +253,11 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
     }
     CBOR_PARSE_MAP_END(map, 1);
 
-    if (rpId.present == false || clientDataHash.present == false) {
+    if (val_c <= 2 || rpId.present == false || clientDataHash.present == false) {
         CBOR_ERROR(CTAP2_ERR_MISSING_PARAMETER);
+    }
+    if (rpId.len == 0 || clientDataHash.len != 32) {
+        CBOR_ERROR(CTAP1_ERR_INVALID_LEN);
     }
     if (pinUvAuthProtocol_present && pinUvAuthProtocol != 1 && pinUvAuthProtocol != 2) {
         CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
@@ -679,7 +716,12 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
         }
     }
 
-    uint32_t ctr = selcred && selcred->imported ? 0 : get_sign_counter();
+    uint32_t ctr = 0;
+    if (!selcred || !selcred->imported) {
+        if (bump_sign_counter(&ctr) != PICOKEYS_OK) {
+            CBOR_ERROR(CTAP2_ERR_PROCESSING);
+        }
+    }
 
     size_t aut_data_len = RP_ID_HASH_LEN + 1 + 4 + ext_len;
     aut_data = (uint8_t *) calloc(1, aut_data_len + clientDataHash.len);
@@ -823,11 +865,6 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
     mbedtls_platform_zeroize(largeBlobKey, sizeof(largeBlobKey));
     CBOR_CHECK(cbor_encoder_close_container(&encoder, &mapEncoder));
     resp_size = cbor_encoder_get_buffer_size(&encoder, ctap_resp->init.data + 1);
-    if (!selcred || !selcred->imported) {
-        ctr++;
-        file_put_data(ef_counter, CONST_BYTE_ARRAY((uint8_t *)&ctr, sizeof(ctr)));
-        flash_commit();
-    }
 err:
     CBOR_FREE_BYTE_STRING(clientDataHash);
     CBOR_FREE_BYTE_STRING(pinUvAuthParam);
