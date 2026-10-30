@@ -778,6 +778,10 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
         if (pinUvAuthProtocol != 1 && pinUvAuthProtocol != 2) {
             CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
         }
+        if ((pinUvAuthProtocol == 1 && pinHashEnc.len != 16) ||
+            (pinUvAuthProtocol == 2 && pinHashEnc.len != 16 + IV_SIZE)) {
+            CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
+        }
         if (subcommand == 0x5 && (permissions != 0 || rpId.present == true)) {
             CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
         }
